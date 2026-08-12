@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: build+test (${{ matrix.os }}, ${{ matrix.cc }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            cc: gcc
+          - os: ubuntu-latest
+            cc: clang
+          - os: macos-latest
+            cc: clang
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: make check
+        run: make check CC=${{ matrix.cc }}
+
+  sanitizers:
+    name: AddressSanitizer + UndefinedBehaviorSanitizer
+    runs-on: ubuntu-latest
+    env:
+      # Without this, ASan's own allocator refuses oversized requests itself
+      # (its own diagnostic, its own exit code) instead of letting malloc()
+      # return NULL -- which preempts this library's own OOM handling
+      # before test_abort_paths.c gets to exercise it. See that file's
+      # header comment.
+      ASAN_OPTIONS: allocator_may_return_null=1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build under ASan+UBSan
+        run: |
+          gcc -std=c11 -Wall -g -fsanitize=address,undefined -I. \
+            -o test_runner_asan \
+            mcxt.c aset.c alignedalloc.c \
+            test/test_mcxt.c test/test_palloc.c test/test_aligned.c \
+            test/test_abort_paths.c test/test_main.c
+
+      - name: Run test suite under the sanitizers
+        run: ./test_runner_asan
+
+  install-smoke-test:
+    name: make install + external consumer program
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install to a scratch prefix
+        run: make install PREFIX="${{ runner.temp }}/mctx-install"
+
+      - name: Compile and run a consumer against the installed headers/library
+        run: |
+          cat > "${{ runner.temp }}/consumer.c" << 'EOF'
+          #include <mctx.h>
+
+          int
+          main(void)
+          {
+              MemoryContextInit();
+
+              MemoryContext work = AllocSetContextCreate(TopMemoryContext, "work",
+                                                          ALLOCSET_DEFAULT_SIZES);
+              MemoryContext old = MemoryContextSwitchTo(work);
+
+              char *buf = palloc(64);
+              (void) buf;
+
+              MemoryContextSwitchTo(old);
+              MemoryContextDelete(work);
+              return 0;
+          }
+          EOF
+          gcc -std=c11 -Wall \
+            -I"${{ runner.temp }}/mctx-install/include/mctx" \
+            -o "${{ runner.temp }}/consumer" \
+            "${{ runner.temp }}/consumer.c" \
+            -L"${{ runner.temp }}/mctx-install/lib" -lmctx
+          "${{ runner.temp }}/consumer"
+
+      - name: Uninstall
+        run: make uninstall PREFIX="${{ runner.temp }}/mctx-install"
